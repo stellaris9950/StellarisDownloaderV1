@@ -1,0 +1,19 @@
+# Ignore everything inside steamcmd
+steamcmd/*
+
+# BUT keep the executable
+!steamcmd/steamcmd.exe
+
+# Python
+__pycache__/
+*.pyc
+
+# Database
+data/app.db
+
+# Logs
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
