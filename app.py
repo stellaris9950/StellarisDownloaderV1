@@ -1,43 +1,168 @@
 import argparse
+import logging
 import sys
+import datetime
+from pathlib import Path
 from core.steamcmd import download_mod
+from core.database import ModDatabase
+from core.updater import check_all_mods_for_updates
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Download Stellaris mods from Steam Workshop using SteamCMD"
-    )
-    parser.add_argument(
-        "workshop_id",
-        help="The Steam Workshop ID of the mod to download"
-    )
-    parser.add_argument(
-        "--download-root",
-        required=True,
-        help="The root directory where the downloaded mod should be exported"
-    )
-    
-    args = parser.parse_args()
-    
+# Configure logging once for the whole app
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def get_db_path():
+    """Get the default database path."""
+    return str(Path(__file__).resolve().parent / "data" / "app.db")
+
+def cmd_download(args):
+    """Handle download command."""
     print(f"Attempting to download mod with Workshop ID: {args.workshop_id}")
     print(f"Download root: {args.download_root}")
     
-    result = download_mod(args.workshop_id, args.download_root)
+    result = download_mod(args.workshop_id, args.download_root, get_db_path())
     
-    print(f"Status: {result['status']}")
+    print(f"\nStatus: {result['status']}")
+    print(f"Workshop ID: {result['workshop_id']}")
     print(f"Mod library path: {result['final_path'] or 'N/A'}")
-    print(f"Junction created: {result['junction_created']}")
+    print(f"Database content path: {result['content_path'] or 'N/A'}")
+    print(f"Title: {result.get('title') or 'N/A'}")
+    print(f"Remote updated at: {result.get('remote_updated_at') or 'N/A'}")
     print(f"Junction verified: {result['junction_verified']}")
-    print(f"Junction path: {result['junction_path']}")
-    print(f"Library target path: {result['library_target_path']}")
     
     if result["status"] == "success":
-        print("Download completed successfully.")
+        print("\nDownload completed successfully.")
         sys.exit(0)
     else:
-        print("Download failed.")
+        print("\nDownload failed.")
         if result["error"]:
             print(f"Error: {result['error']}")
         sys.exit(1)
+
+def cmd_list(args):
+    """Handle list command."""
+    db = ModDatabase(get_db_path())
+    mods = db.list_all_mods()
+    
+    if not mods:
+        print("No mods in database.")
+        sys.exit(0)
+    
+    print(f"\n{'Workshop ID':<15} | {'Title':<35} | {'Status':<10} | {'Last Downloaded':<20} | {'Content Path':<50}")
+    print("-" * 150)
+    
+    for mod in mods:
+        workshop_id = mod['workshop_id']
+        title = mod['title'] or "N/A"
+        status = mod['status']
+        last_downloaded = mod['last_downloaded_at'] or 0
+        content_path = mod['content_path'] or "N/A"
+        
+        # Format timestamp
+        if last_downloaded and last_downloaded > 0:
+            dt = datetime.datetime.fromtimestamp(last_downloaded)
+            last_downloaded_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            last_downloaded_str = "N/A"
+        
+        title_truncated = (title[:32] + "...") if len(title) > 35 else title
+        path_truncated = (content_path[:47] + "...") if len(content_path) > 50 else content_path
+        
+        print(f"{workshop_id:<15} | {title_truncated:<35} | {status:<10} | {last_downloaded_str:<20} | {path_truncated:<50}")
+    
+    print(f"\nTotal mods: {len(mods)}")
+    sys.exit(0)
+
+def cmd_check_updates(args):
+    """Handle check-updates command."""
+    db = ModDatabase(get_db_path())
+    mods = db.list_all_mods()
+    
+    if not mods:
+        print("No mods in database.")
+        sys.exit(0)
+    
+    print("\nChecking for updates...")
+    results = check_all_mods_for_updates(mods)
+    
+    stats = {
+        "up_to_date": 0,
+        "update_available": 0,
+        "failed_check": 0
+    }
+    
+    print(f"\n{'Workshop ID':<15} | {'Title':<30} | {'Status':<18} | {'Stored Updated':<20} | {'Latest Updated':<20}")
+    print("-" * 125)
+    
+    for result in results:
+        workshop_id = result['workshop_id']
+        title = result.get('latest_title') or "N/A"
+        status = result['status']
+        stored_ts = result['stored_remote_updated_at'] or 0
+        latest_ts = result['latest_remote_updated_at'] or 0
+        
+        stats[status] += 1
+        
+        # Format timestamps
+        if stored_ts and stored_ts > 0:
+            stored_dt = datetime.datetime.fromtimestamp(stored_ts)
+            stored_str = stored_dt.strftime("%Y-%m-%d %H:%M")
+        else:
+            stored_str = "N/A"
+        
+        if latest_ts and latest_ts > 0:
+            latest_dt = datetime.datetime.fromtimestamp(latest_ts)
+            latest_str = latest_dt.strftime("%Y-%m-%d %H:%M")
+        else:
+            latest_str = "N/A"
+        
+        title_truncated = (title[:27] + "...") if len(title) > 30 else title
+        
+        print(f"{workshop_id:<15} | {title_truncated:<30} | {status:<18} | {stored_str:<20} | {latest_str:<20}")
+        
+        if result.get('error'):
+            print(f"  └─ Error: {result['error']}")
+    
+    print(f"\n{'Summary':<15} | {'Up to Date':<15} | {'Updates Available':<15} | {'Check Failed':<15}")
+    print("-" * 65)
+    print(f"{'Totals':<15} | {stats['up_to_date']:<15} | {stats['update_available']:<15} | {stats['failed_check']:<15}")
+    
+    sys.exit(0)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Stellaris Steam Workshop downloader and manager"
+    )
+    
+    subparsers = parser.add_subparsers(dest='command', help='Command to execute')
+    
+    # Download command
+    download_parser = subparsers.add_parser('download', help='Download a mod from Steam Workshop')
+    download_parser.add_argument(
+        "workshop_id",
+        help="The Steam Workshop ID of the mod to download"
+    )
+    download_parser.add_argument(
+        "--download-root",
+        required=True,
+        help="The root directory where the downloaded mod should be stored"
+    )
+    download_parser.set_defaults(func=cmd_download)
+    
+    # List command
+    list_parser = subparsers.add_parser('list', help='List all tracked mods')
+    list_parser.set_defaults(func=cmd_list)
+    
+    # Check-updates command
+    check_updates_parser = subparsers.add_parser('check-updates', help='Check for mod updates')
+    check_updates_parser.set_defaults(func=cmd_check_updates)
+    
+    args = parser.parse_args()
+    
+    if not hasattr(args, 'func'):
+        parser.print_help()
+        sys.exit(1)
+    
+    args.func(args)
 
 if __name__ == "__main__":
     main()
