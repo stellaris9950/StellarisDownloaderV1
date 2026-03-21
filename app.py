@@ -6,6 +6,7 @@ from pathlib import Path
 from core.steamcmd import download_mod
 from core.database import ModDatabase
 from core.updater import check_all_mods_for_updates, update_mod, update_all_mods
+from core.settings import SettingsManager
 
 # Configure logging once for the whole app
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -14,12 +15,49 @@ def get_db_path():
     """Get the default database path."""
     return str(Path(__file__).resolve().parent / "data" / "app.db")
 
+def get_settings_path():
+    """Get the default settings path."""
+    return str(Path(__file__).resolve().parent / "data" / "settings.json")
+
+def resolve_download_root(explicit_root: str = None) -> str:
+    """
+    Resolve download root with precedence: explicit > settings > fail.
+    
+    Args:
+        explicit_root: Optional explicit download root from CLI
+    
+    Returns:
+        Resolved download root path
+    
+    Raises:
+        ValueError: If no root available
+    """
+    if explicit_root:
+        return explicit_root
+    
+    settings = SettingsManager(get_settings_path())
+    stored_root = settings.get_library_root()
+    
+    if stored_root:
+        return stored_root
+    
+    raise ValueError(
+        "No library root specified. Use --download-root to provide it, "
+        "or run 'python app.py set-library-root <path>' to save a default."
+    )
+
 def cmd_download(args):
     """Handle download command."""
-    print(f"Attempting to download mod with Workshop ID: {args.workshop_id}")
-    print(f"Download root: {args.download_root}")
+    try:
+        download_root = resolve_download_root(getattr(args, 'download_root', None))
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     
-    result = download_mod(args.workshop_id, args.download_root, get_db_path())
+    print(f"Attempting to download mod with Workshop ID: {args.workshop_id}")
+    print(f"Download root: {download_root}")
+    
+    result = download_mod(args.workshop_id, download_root, get_db_path())
     
     print(f"\nStatus: {result['status']}")
     print(f"Workshop ID: {result['workshop_id']}")
@@ -128,6 +166,100 @@ def cmd_check_updates(args):
     
     sys.exit(0)
 
+
+def cmd_set_library_root(args):
+    """Handle set-library-root command."""
+    print(f"Setting library root to: {args.path}")
+    
+    try:
+        settings = SettingsManager(get_settings_path())
+        settings.set_library_root(args.path)
+        print("Library root saved successfully.")
+        sys.exit(0)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Failed to save library root: {e}")
+        sys.exit(1)
+
+
+def cmd_show_settings(args):
+    """Handle show-settings command."""
+    settings = SettingsManager(get_settings_path())
+    all_settings = settings.get_all_settings()
+    
+    if not all_settings:
+        print("No settings configured.")
+        print("\nTo set a library root, run:")
+        print("  python app.py set-library-root <path>")
+        sys.exit(0)
+    
+    print("\nCurrent settings:")
+    print("-" * 50)
+    for key, value in all_settings.items():
+        print(f"{key:<20} : {value}")
+    print("-" * 50)
+    
+    sys.exit(0)
+
+
+def cmd_update(args):
+    """Handle update command."""
+    try:
+        download_root = resolve_download_root(getattr(args, 'download_root', None))
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    
+    print(f"Attempting to update mod with Workshop ID: {args.workshop_id}")
+    print(f"Download root: {download_root}")
+
+    result = update_mod(args.workshop_id, download_root, get_db_path())
+
+    print(f"\nStatus: {result.get('status')}")
+    print(f"Workshop ID: {result.get('workshop_id')}")
+    if result.get('error'):
+        print(f"Error: {result.get('error')}")
+
+    if result.get('status') == 'success':
+        print("\nUpdate completed successfully.")
+        sys.exit(0)
+    else:
+        print("\nUpdate did not complete successfully.")
+        sys.exit(1)
+
+
+def cmd_update_all(args):
+    """Handle update-all command."""
+    try:
+        download_root = resolve_download_root(getattr(args, 'download_root', None))
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    
+    print("Attempting to update all tracked mods")
+    print(f"Download root: {download_root}")
+
+    result = update_all_mods(download_root, get_db_path())
+
+    print(f"\nUpdated: {result.get('updated')}")
+    print(f"Skipped: {result.get('skipped')}")
+    print(f"Failed: {result.get('failed')}")
+
+    for detail in result.get('details', []):
+        action = detail.get('action')
+        workshop_id = detail.get('workshop_id')
+        print(f" - {workshop_id}: {action}")
+
+    if result.get('failed', 0) == 0:
+        print("\nUpdate-all completed (no failures).")
+        sys.exit(0)
+    else:
+        print("\nUpdate-all completed with some failures.")
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Stellaris Steam Workshop downloader and manager"
@@ -143,8 +275,8 @@ def main():
     )
     download_parser.add_argument(
         "--download-root",
-        required=True,
-        help="The root directory where the downloaded mod should be stored"
+        required=False,
+        help="The root directory where the downloaded mod should be stored (optional if library root is configured)"
     )
     download_parser.set_defaults(func=cmd_download)
     
@@ -164,8 +296,8 @@ def main():
     )
     update_parser.add_argument(
         '--download-root',
-        required=True,
-        help='The root directory where the mod should be stored'
+        required=False,
+        help='The root directory where the mod should be stored (optional if library root is configured)'
     )
     update_parser.set_defaults(func=cmd_update)
 
@@ -173,10 +305,22 @@ def main():
     update_all_parser = subparsers.add_parser('update-all', help='Update all tracked mods with available updates')
     update_all_parser.add_argument(
         '--download-root',
-        required=True,
-        help='The root directory where mods should be stored'
+        required=False,
+        help='The root directory where mods should be stored (optional if library root is configured)'
     )
     update_all_parser.set_defaults(func=cmd_update_all)
+    
+    # Set library root command
+    set_library_root_parser = subparsers.add_parser('set-library-root', help='Set the default library root for mod storage')
+    set_library_root_parser.add_argument(
+        'path',
+        help='The path to use as the default library root'
+    )
+    set_library_root_parser.set_defaults(func=cmd_set_library_root)
+    
+    # Show settings command
+    show_settings_parser = subparsers.add_parser('show-settings', help='Display current application settings')
+    show_settings_parser.set_defaults(func=cmd_show_settings)
     
     args = parser.parse_args()
     
@@ -186,49 +330,6 @@ def main():
     
     args.func(args)
 
-
-def cmd_update(args):
-    """Handle update command."""
-    print(f"Attempting to update mod with Workshop ID: {args.workshop_id}")
-    print(f"Download root: {args.download_root}")
-
-    result = update_mod(args.workshop_id, args.download_root, get_db_path())
-
-    print(f"\nStatus: {result.get('status')}")
-    print(f"Workshop ID: {result.get('workshop_id')}")
-    if result.get('error'):
-        print(f"Error: {result.get('error')}")
-
-    if result.get('status') == 'success':
-        print("\nUpdate completed successfully.")
-        sys.exit(0)
-    else:
-        print("\nUpdate did not complete successfully.")
-        sys.exit(1)
-
-
-def cmd_update_all(args):
-    """Handle update-all command."""
-    print("Attempting to update all tracked mods")
-    print(f"Download root: {args.download_root}")
-
-    result = update_all_mods(args.download_root, get_db_path())
-
-    print(f"\nUpdated: {result.get('updated')}")
-    print(f"Skipped: {result.get('skipped')}")
-    print(f"Failed: {result.get('failed')}")
-
-    for detail in result.get('details', []):
-        action = detail.get('action')
-        workshop_id = detail.get('workshop_id')
-        print(f" - {workshop_id}: {action}")
-
-    if result.get('failed', 0) == 0:
-        print("\nUpdate-all completed (no failures).")
-        sys.exit(0)
-    else:
-        print("\nUpdate-all completed with some failures.")
-        sys.exit(1)
 
 if __name__ == "__main__":
     main()
