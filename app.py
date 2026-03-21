@@ -5,7 +5,7 @@ import datetime
 from pathlib import Path
 from core.steamcmd import download_mod
 from core.database import ModDatabase
-from core.updater import check_all_mods_for_updates
+from core.updater import check_all_mods_for_updates, update_mod, update_all_mods
 
 # Configure logging once for the whole app
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -155,6 +155,28 @@ def main():
     # Check-updates command
     check_updates_parser = subparsers.add_parser('check-updates', help='Check for mod updates')
     check_updates_parser.set_defaults(func=cmd_check_updates)
+
+    # Update command
+    update_parser = subparsers.add_parser('update', help='Update a tracked mod if a newer version exists')
+    update_parser.add_argument(
+        'workshop_id',
+        help='The Steam Workshop ID of the mod to update'
+    )
+    update_parser.add_argument(
+        '--download-root',
+        required=True,
+        help='The root directory where the mod should be stored'
+    )
+    update_parser.set_defaults(func=cmd_update)
+
+    # Update-all command
+    update_all_parser = subparsers.add_parser('update-all', help='Update all tracked mods with available updates')
+    update_all_parser.add_argument(
+        '--download-root',
+        required=True,
+        help='The root directory where mods should be stored'
+    )
+    update_all_parser.set_defaults(func=cmd_update_all)
     
     args = parser.parse_args()
     
@@ -163,6 +185,50 @@ def main():
         sys.exit(1)
     
     args.func(args)
+
+
+def cmd_update(args):
+    """Handle update command."""
+    print(f"Attempting to update mod with Workshop ID: {args.workshop_id}")
+    print(f"Download root: {args.download_root}")
+
+    result = update_mod(args.workshop_id, args.download_root, get_db_path())
+
+    print(f"\nStatus: {result.get('status')}")
+    print(f"Workshop ID: {result.get('workshop_id')}")
+    if result.get('error'):
+        print(f"Error: {result.get('error')}")
+
+    if result.get('status') == 'success':
+        print("\nUpdate completed successfully.")
+        sys.exit(0)
+    else:
+        print("\nUpdate did not complete successfully.")
+        sys.exit(1)
+
+
+def cmd_update_all(args):
+    """Handle update-all command."""
+    print("Attempting to update all tracked mods")
+    print(f"Download root: {args.download_root}")
+
+    result = update_all_mods(args.download_root, get_db_path())
+
+    print(f"\nUpdated: {result.get('updated')}")
+    print(f"Skipped: {result.get('skipped')}")
+    print(f"Failed: {result.get('failed')}")
+
+    for detail in result.get('details', []):
+        action = detail.get('action')
+        workshop_id = detail.get('workshop_id')
+        print(f" - {workshop_id}: {action}")
+
+    if result.get('failed', 0) == 0:
+        print("\nUpdate-all completed (no failures).")
+        sys.exit(0)
+    else:
+        print("\nUpdate-all completed with some failures.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
