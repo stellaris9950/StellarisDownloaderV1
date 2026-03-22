@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -8,8 +9,11 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QFormLayout, QFileDialog,
     QMenuBar, QMenu, QMessageBox, QProgressBar, QCheckBox, QProgressDialog
 )
-from PySide6.QtCore import Qt, QThread, Signal, QSize, QUrl, QByteArray
+from PySide6.QtCore import Qt, QThread, Signal, QSize, QUrl, QByteArray, QTimer, QObject, Slot, QUrlQuery
 from PySide6.QtGui import QPixmap, QDesktopServices, QAction, QTextCursor, QTextCharFormat, QColor, QFont
+from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebChannel import QWebChannel
 
 from core.database import ModDatabase
 from core.i18n import tr
@@ -18,6 +22,40 @@ from core.settings import SettingsManager
 from core.updater import check_all_mods_for_updates, update_mod, update_all_mods
 from core.steamcmd import download_mod
 from core.workshop_api import fetch_mod_metadata
+
+
+def resolve_workshop_title(workshop_id, db_path=None):
+    if db_path:
+        mod_record = ModDatabase(db_path).get_mod(workshop_id)
+        if mod_record and mod_record.get("title"):
+            return mod_record["title"]
+
+    metadata = fetch_mod_metadata(workshop_id)
+    if metadata and metadata.get("title"):
+        return metadata["title"]
+    return tr("unknown_mod")
+
+
+class WorkshopTitleLookupThread(QThread):
+    resolved = Signal(str, str)
+
+    def __init__(self, workshop_id, db_path=None):
+        super().__init__()
+        self.workshop_id = workshop_id
+        self.db_path = db_path
+
+    def run(self):
+        title = resolve_workshop_title(self.workshop_id, self.db_path)
+        self.resolved.emit(self.workshop_id, title)
+
+
+class WorkshopQueueBridge(QObject):
+    queue_toggled = Signal(str)
+
+    @Slot(str)
+    def toggleQueueItem(self, workshop_id):
+        self.queue_toggled.emit(workshop_id)
+
 
 class ModListItem(QListWidgetItem):
     """Custom list item for mod display."""
@@ -62,6 +100,8 @@ class DownloadFromUrlIdDialog(QDialog):
         self.resize(520, 400)
 
         self.queue = []
+        self.queue_titles = {}
+        self.title_lookup_threads = {}
 
         main_layout = QVBoxLayout(self)
 
@@ -103,6 +143,8 @@ class DownloadFromUrlIdDialog(QDialog):
 
         self.queue_list = QListWidget()
         self.queue_list.setSelectionMode(QListWidget.MultiSelection)
+        self.queue_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.queue_list.customContextMenuRequested.connect(self.show_queue_context_menu)
         main_layout.addWidget(self.queue_list)
 
         bottom_buttons = QDialogButtonBox(QDialogButtonBox.Close)
@@ -155,8 +197,33 @@ class DownloadFromUrlIdDialog(QDialog):
     def update_queue_ui(self):
         self.queue_list.clear()
         for wid in self.queue:
-            self.queue_list.addItem(wid)
+            item = QListWidgetItem(
+                tr("label_queue_item").format(
+                    title=self.queue_titles.get(wid, tr("unknown_mod")),
+                    workshop_id=wid
+                )
+            )
+            item.setData(Qt.UserRole, wid)
+            self.queue_list.addItem(item)
         self.queue_label.setText(f"{tr('label_mods_to_download')} ({len(self.queue)})")
+
+    def ensure_queue_title_async(self, workshop_id):
+        if self.queue_titles.get(workshop_id) not in {None, tr("unknown_mod")}:
+            return
+        if workshop_id in self.title_lookup_threads:
+            return
+
+        db_path = self.parent_window.db_path if self.parent_window else None
+        worker = WorkshopTitleLookupThread(workshop_id, db_path)
+        worker.resolved.connect(self.on_queue_title_resolved)
+        worker.finished.connect(lambda wid=workshop_id: self.title_lookup_threads.pop(wid, None))
+        self.title_lookup_threads[workshop_id] = worker
+        worker.start()
+
+    def on_queue_title_resolved(self, workshop_id, title):
+        self.queue_titles[workshop_id] = title or tr("unknown_mod")
+        if workshop_id in self.queue:
+            self.update_queue_ui()
 
     def add_to_list(self):
         raw = self.workshop_id_edit.text().strip()
@@ -170,7 +237,9 @@ class DownloadFromUrlIdDialog(QDialog):
             return
 
         self.queue.append(wid)
+        self.queue_titles.setdefault(wid, tr("unknown_mod"))
         self.update_queue_ui()
+        self.ensure_queue_title_async(wid)
         self.workshop_id_edit.clear()
 
     def clear_input(self):
@@ -181,7 +250,7 @@ class DownloadFromUrlIdDialog(QDialog):
         if not selections:
             return
         for item in selections:
-            wid = item.text()
+            wid = item.data(Qt.UserRole)
             if wid in self.queue:
                 self.queue.remove(wid)
         self.update_queue_ui()
@@ -189,6 +258,27 @@ class DownloadFromUrlIdDialog(QDialog):
     def clear_list(self):
         self.queue = []
         self.update_queue_ui()
+
+    def show_queue_context_menu(self, position):
+        item = self.queue_list.itemAt(position)
+        if not item:
+            return
+
+        selected_items = self.queue_list.selectedItems()
+        selected_ids = [selected_item.data(Qt.UserRole) for selected_item in selected_items]
+        wid = item.data(Qt.UserRole)
+        remove_ids = [wid]
+        remove_label = tr("button_remove_this_mod")
+        if len(selected_ids) > 1 and wid in selected_ids:
+            remove_ids = selected_ids
+            remove_label = tr("button_remove_selected_mods")
+
+        menu = QMenu(self)
+        remove_action = menu.addAction(remove_label)
+        chosen_action = menu.exec(self.queue_list.mapToGlobal(position))
+        if chosen_action == remove_action:
+            self.queue = [queue_id for queue_id in self.queue if queue_id not in remove_ids]
+            self.update_queue_ui()
 
     def on_download(self):
         current_raw = self.workshop_id_edit.text().strip()
@@ -208,6 +298,8 @@ class DownloadFromUrlIdDialog(QDialog):
             if response == QMessageBox.Yes:
                 if current_id not in self.queue:
                     self.queue.append(current_id)
+                    self.queue_titles.setdefault(current_id, tr("unknown_mod"))
+                    self.ensure_queue_title_async(current_id)
                 self.update_queue_ui()
             # if No then just use existing queue without adding input item
 
@@ -216,6 +308,8 @@ class DownloadFromUrlIdDialog(QDialog):
                 QMessageBox.warning(self, tr("warning_no_mod_selected_title"), tr("warning_no_mod_selected_message"))
                 return
             self.queue = [current_id]
+            self.queue_titles.setdefault(current_id, tr("unknown_mod"))
+            self.ensure_queue_title_async(current_id)
 
         # now queue has item(s)
         self.parent_window.start_download_for_ids(self.queue.copy())
@@ -223,6 +317,733 @@ class DownloadFromUrlIdDialog(QDialog):
         self.queue = []
         self.update_queue_ui()
         self.workshop_id_edit.clear()
+
+
+class RestrictedWorkshopPage(QWebEnginePage):
+    """Restrict browser navigation to Steam-owned pages."""
+
+    def __init__(self, block_callback=None, queue_toggle_callback=None, parent=None):
+        super().__init__(parent)
+        self.block_callback = block_callback
+        self.queue_toggle_callback = queue_toggle_callback
+
+    @staticmethod
+    def is_allowed_url(url):
+        if not url.isValid():
+            return False
+        if url.scheme() == "about" and url.toString() == "about:blank":
+            return True
+        if url.scheme() not in {"http", "https"}:
+            return False
+        host = url.host().lower()
+        allowed_hosts = {
+            "steamcommunity.com",
+            "store.steampowered.com",
+            "help.steampowered.com",
+            "steampowered.com",
+            "www.steamcommunity.com",
+            "www.steampowered.com",
+        }
+        if host in allowed_hosts:
+            return True
+        return host.endswith(".steampowered.com")
+
+    def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+        if url.scheme() == "stellarisqueue":
+            if self.queue_toggle_callback:
+                query = QUrlQuery(url)
+                workshop_id = query.queryItemValue("id")
+                if workshop_id:
+                    QTimer.singleShot(0, lambda wid=workshop_id: self.queue_toggle_callback(wid))
+            return False
+
+        allowed = self.is_allowed_url(url)
+        if allowed:
+            return True
+        if is_main_frame and self.block_callback:
+            QTimer.singleShot(0, self.block_callback)
+        return False
+
+    def javaScriptConsoleMessage(self, level, message, line_number, source_id):
+        queue_prefix = "__STELLARIS_QUEUE__"
+        if message.startswith(queue_prefix) and self.queue_toggle_callback:
+            workshop_id = message[len(queue_prefix):].strip()
+            if workshop_id:
+                QTimer.singleShot(0, lambda wid=workshop_id: self.queue_toggle_callback(wid))
+            return
+        super().javaScriptConsoleMessage(level, message, line_number, source_id)
+
+
+class WorkshopBrowserDialog(QDialog):
+    """Embedded browser shell for browsing the Stellaris Workshop."""
+
+    WORKSHOP_URL = "https://steamcommunity.com/app/281990/workshop/"
+    WORKSHOP_CARD_ROOT_SELECTORS = [
+        ".workshopItem",
+        ".workshopItemCollection",
+        ".browseItem",
+        ".item",
+        ".search_result_row",
+        ".workshopBrowseItems > div",
+        ".workshopBrowseItems .workshopItemPreviewHolder",
+        ".workshopItemPreviewHolder",
+    ]
+    WORKSHOP_LINK_SELECTOR = 'a[href*="sharedfiles/filedetails"]'
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.queue = []
+        self.queue_titles = {}
+        self.title_lookup_threads = {}
+        self.current_workshop_id = None
+        self.queue_bridge = WorkshopQueueBridge()
+        self.queue_bridge.queue_toggled.connect(self.toggle_queue_item_from_js)
+
+        self.setWindowTitle(tr("dialog_workshop_browser"))
+        self.resize(1400, 850)
+        self.setModal(True)
+
+        main_layout = QVBoxLayout(self)
+
+        splitter = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(splitter, 1)
+
+        queue_panel = QWidget()
+        queue_layout = QVBoxLayout(queue_panel)
+        queue_layout.setContentsMargins(8, 8, 8, 8)
+        queue_layout.setSpacing(8)
+
+        self.queue_label = QLabel(f"{tr('label_selected_mods')} (0)")
+        queue_layout.addWidget(self.queue_label)
+
+        self.queue_list = QListWidget()
+        self.queue_list.setSelectionMode(QListWidget.MultiSelection)
+        self.queue_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.queue_list.customContextMenuRequested.connect(self.show_queue_context_menu)
+        queue_layout.addWidget(self.queue_list, 1)
+
+        self.queue_add_button = QPushButton(tr("button_add_to_list"))
+        self.queue_add_button.clicked.connect(self.add_current_mod)
+        queue_layout.addWidget(self.queue_add_button)
+
+        self.download_queue_button = QPushButton(tr("button_download_queue"))
+        self.download_queue_button.clicked.connect(self.download_queue)
+        queue_layout.addWidget(self.download_queue_button)
+
+        self.remove_selected_button = QPushButton(tr("button_remove_selected"))
+        self.remove_selected_button.clicked.connect(self.remove_selected)
+        queue_layout.addWidget(self.remove_selected_button)
+
+        self.clear_list_button = QPushButton(tr("button_clear_list"))
+        self.clear_list_button.clicked.connect(self.clear_list)
+        queue_layout.addWidget(self.clear_list_button)
+
+        splitter.addWidget(queue_panel)
+
+        browser_panel = QWidget()
+        browser_layout = QVBoxLayout(browser_panel)
+        browser_layout.setContentsMargins(8, 8, 8, 8)
+        browser_layout.setSpacing(8)
+
+        self.page_title_label = QLabel(tr("label_current_page"))
+        browser_layout.addWidget(self.page_title_label)
+
+        self.url_edit = QLineEdit()
+        self.url_edit.setReadOnly(True)
+        browser_layout.addWidget(self.url_edit)
+
+        nav_layout = QHBoxLayout()
+        self.back_button = QPushButton(tr("button_back"))
+        self.back_button.clicked.connect(self.go_back)
+        nav_layout.addWidget(self.back_button)
+
+        self.forward_button = QPushButton(tr("button_forward"))
+        self.forward_button.clicked.connect(self.go_forward)
+        nav_layout.addWidget(self.forward_button)
+
+        self.reload_button = QPushButton(tr("button_reload"))
+        self.reload_button.clicked.connect(self.reload_page)
+        nav_layout.addWidget(self.reload_button)
+
+        self.add_current_button = QPushButton(tr("button_add_current_mod"))
+        self.add_current_button.clicked.connect(self.add_current_mod)
+        self.add_current_button.setVisible(False)
+        nav_layout.addWidget(self.add_current_button)
+
+        nav_layout.addStretch()
+        browser_layout.addLayout(nav_layout)
+
+        self.browser_view = QWebEngineView()
+        self.browser_page = RestrictedWorkshopPage(self.show_blocked_page, self.toggle_queue_item_from_js, self.browser_view)
+        self.web_channel = QWebChannel(self.browser_page)
+        self.web_channel.registerObject("stellarisBridge", self.queue_bridge)
+        self.browser_page.setWebChannel(self.web_channel)
+        self.browser_view.setPage(self.browser_page)
+        self.browser_view.urlChanged.connect(self.on_browser_url_changed)
+        self.browser_view.titleChanged.connect(self.on_browser_title_changed)
+        self.browser_view.loadFinished.connect(self.on_browser_load_finished)
+        browser_layout.addWidget(self.browser_view, 1)
+
+        splitter.addWidget(browser_panel)
+
+        splitter.setSizes([360, 1040])
+
+        self.update_current_mod_state()
+        self.browser_view.setUrl(QUrl(self.WORKSHOP_URL))
+
+    @staticmethod
+    def extract_mod_page_workshop_id(url):
+        if isinstance(url, QUrl):
+            url = url.toString()
+        if not url:
+            return None
+
+        parsed_url = QUrl(url)
+        if parsed_url.host().lower() != "steamcommunity.com":
+            return None
+        if not parsed_url.path().lower().startswith("/sharedfiles/filedetails"):
+            return None
+        return DownloadFromUrlIdDialog.extract_workshop_id(url)
+
+    def show_blocked_page(self):
+        self.browser_view.setHtml("")
+        self.url_edit.clear()
+        self.page_title_label.setText(tr("label_current_page"))
+        self.current_workshop_id = None
+        self.update_current_mod_state()
+
+    def update_current_mod_state(self):
+        has_mod = bool(self.current_workshop_id)
+        self.add_current_button.setVisible(has_mod)
+        self.queue_add_button.setEnabled(has_mod)
+
+    def get_downloaded_workshop_ids(self):
+        if not self.parent_window:
+            return []
+        db = ModDatabase(self.parent_window.db_path)
+        return [
+            mod["workshop_id"]
+            for mod in db.list_all_mods()
+            if mod.get("status") == "success"
+        ]
+
+    def get_queue_sync_script(self):
+        queued_ids_json = json.dumps(self.queue)
+        downloaded_ids_json = json.dumps(self.get_downloaded_workshop_ids())
+        add_tooltip = json.dumps(tr("tooltip_add_to_queue"))
+        remove_tooltip = json.dumps(tr("tooltip_remove_from_queue"))
+        downloaded_tooltip = json.dumps(tr("tooltip_already_downloaded"))
+        card_selectors_json = json.dumps(self.WORKSHOP_CARD_ROOT_SELECTORS)
+        link_selector_json = json.dumps(self.WORKSHOP_LINK_SELECTOR)
+
+        return f"""
+(function() {{
+    const cardSelectors = {card_selectors_json};
+    const linkSelector = {link_selector_json};
+    const queuedIds = {queued_ids_json};
+    const downloadedIds = {downloaded_ids_json};
+    const addTooltip = {add_tooltip};
+    const removeTooltip = {remove_tooltip};
+    const downloadedTooltip = {downloaded_tooltip};
+
+    function ensureBridge(callback) {{
+        function initChannel() {{
+            if (window.stellarisBridge) {{
+                callback();
+                return;
+            }}
+            new QWebChannel(qt.webChannelTransport, function(channel) {{
+                window.stellarisBridge = channel.objects.stellarisBridge;
+                callback();
+            }});
+        }}
+
+        if (window.stellarisBridge) {{
+            callback();
+            return;
+        }}
+        if (typeof QWebChannel !== 'undefined' && window.qt && qt.webChannelTransport) {{
+            initChannel();
+            return;
+        }}
+        if (!document.getElementById('stellaris-qt-webchannel-script')) {{
+            const script = document.createElement('script');
+            script.id = 'stellaris-qt-webchannel-script';
+            script.src = 'qrc:///qtwebchannel/qwebchannel.js';
+            script.onload = initChannel;
+            document.head.appendChild(script);
+        }}
+    }}
+
+    function requestToggle(workshopId) {{
+        ensureBridge(function() {{
+            if (window.stellarisBridge && typeof window.stellarisBridge.toggleQueueItem === 'function') {{
+                window.stellarisBridge.toggleQueueItem(workshopId);
+            }}
+        }});
+    }}
+
+    function extractWorkshopId(url) {{
+        if (!url) return null;
+        try {{
+            const parsed = new URL(url, window.location.origin);
+            const id = parsed.searchParams.get('id');
+            if (id && /^\\d+$/.test(id)) return id;
+            const pathParts = parsed.pathname.split('/').filter(Boolean);
+            for (let i = pathParts.length - 1; i >= 0; i--) {{
+                if (/^\\d+$/.test(pathParts[i])) return pathParts[i];
+            }}
+        }} catch (error) {{
+            return null;
+        }}
+        return null;
+    }}
+
+    function findCardRoot(link) {{
+        for (const selector of cardSelectors) {{
+            const card = link.closest(selector);
+            if (card) return card;
+        }}
+        return null;
+    }}
+
+    function applyButtonState(button, workshopId) {{
+        if (downloadedIds.includes(workshopId)) {{
+            button.textContent = '✓';
+            button.title = downloadedTooltip;
+            button.dataset.state = 'downloaded';
+            button.style.background = '#48b64a';
+            button.style.cursor = 'default';
+            return;
+        }}
+        if (queuedIds.includes(workshopId)) {{
+            button.textContent = '−';
+            button.title = removeTooltip;
+            button.dataset.state = 'queued';
+            button.style.background = '#f5a623';
+            button.style.cursor = 'pointer';
+            return;
+        }}
+        button.textContent = '+';
+        button.title = addTooltip;
+        button.dataset.state = 'available';
+        button.style.background = '#2f8ef3';
+        button.style.cursor = 'pointer';
+    }}
+
+    function createButton(card, workshopId) {{
+        let button = card.querySelector('.stellaris-queue-button');
+        if (!button) {{
+            if (getComputedStyle(card).position === 'static') {{
+                card.style.position = 'relative';
+            }}
+            button = document.createElement('button');
+            button.className = 'stellaris-queue-button';
+            button.type = 'button';
+            button.style.position = 'absolute';
+            button.style.top = '10px';
+            button.style.right = '10px';
+            button.style.width = '48px';
+            button.style.height = '48px';
+            button.style.border = '0';
+            button.style.borderRadius = '12px';
+            button.style.boxShadow = '0 6px 18px rgba(0,0,0,0.35)';
+            button.style.color = '#ffffff';
+            button.style.fontSize = '30px';
+            button.style.fontWeight = '700';
+            button.style.lineHeight = '1';
+            button.style.zIndex = '999';
+            button.style.opacity = '0.92';
+            button.style.transition = 'transform 0.15s ease, opacity 0.15s ease';
+            button.onmouseenter = () => {{ button.style.transform = 'scale(1.06)'; button.style.opacity = '1'; }};
+            button.onmouseleave = () => {{ button.style.transform = 'scale(1)'; button.style.opacity = '0.92'; }};
+            button.addEventListener('click', function(event) {{
+                event.preventDefault();
+                event.stopPropagation();
+                if (!window.stellarisBridge) return;
+                if (button.dataset.state === 'downloaded') return;
+                window.stellarisBridge.toggleQueueItem(workshopId);
+            }});
+            card.appendChild(button);
+        }}
+        button.dataset.workshopId = workshopId;
+        applyButtonState(button, workshopId);
+    }}
+
+    function injectButtons() {{
+        const links = document.querySelectorAll(linkSelector);
+        links.forEach((link) => {{
+            const workshopId = extractWorkshopId(link.href);
+            if (!workshopId) return;
+            const card = findCardRoot(link);
+            if (!card) return;
+            createButton(card, workshopId);
+        }});
+    }}
+
+    ensureBridge(function() {{
+        injectButtons();
+        if (!window.__stellarisQueueObserver) {{
+            window.__stellarisQueueObserver = new MutationObserver(function() {{
+                injectButtons();
+            }});
+            window.__stellarisQueueObserver.observe(document.body, {{
+                childList: true,
+                subtree: true
+            }});
+        }}
+        window.__stellarisInjectButtons = injectButtons;
+    }});
+}})();
+"""
+
+    def get_queue_sync_script(self):
+        queued_ids_json = json.dumps(self.queue)
+        downloaded_ids_json = json.dumps(self.get_downloaded_workshop_ids())
+        add_tooltip = json.dumps(tr("tooltip_add_to_queue"))
+        remove_tooltip = json.dumps(tr("tooltip_remove_from_queue"))
+        downloaded_tooltip = json.dumps(tr("tooltip_already_downloaded"))
+        card_selectors_json = json.dumps(self.WORKSHOP_CARD_ROOT_SELECTORS)
+        link_selector_json = json.dumps(self.WORKSHOP_LINK_SELECTOR)
+
+        return f"""
+(function() {{
+    const cardSelectors = {card_selectors_json};
+    const linkSelector = {link_selector_json};
+    const queuedIds = {queued_ids_json};
+    const downloadedIds = {downloaded_ids_json};
+    const addTooltip = {add_tooltip};
+    const removeTooltip = {remove_tooltip};
+    const downloadedTooltip = {downloaded_tooltip};
+
+    function ensureBridge(callback) {{
+        function initChannel() {{
+            if (window.stellarisBridge) {{
+                callback();
+                return;
+            }}
+            if (typeof QWebChannel === 'function' && window.qt && qt.webChannelTransport) {{
+                new QWebChannel(qt.webChannelTransport, function(channel) {{
+                    window.stellarisBridge = channel.objects.stellarisBridge;
+                    callback();
+                }});
+            }}
+        }}
+
+        if (window.stellarisBridge) {{
+            callback();
+            return;
+        }}
+        if (typeof QWebChannel === 'function' && window.qt && qt.webChannelTransport) {{
+            initChannel();
+            return;
+        }}
+        if (!document.getElementById('stellaris-qt-webchannel-script')) {{
+            const script = document.createElement('script');
+            script.id = 'stellaris-qt-webchannel-script';
+            script.src = 'qrc:///qtwebchannel/qwebchannel.js';
+            script.onload = initChannel;
+            document.head.appendChild(script);
+        }}
+    }}
+
+    function requestToggle(workshopId) {{
+        console.info('__STELLARIS_QUEUE__' + workshopId);
+    }}
+
+    function extractWorkshopId(url) {{
+        if (!url) return null;
+        try {{
+            const parsed = new URL(url, window.location.origin);
+            const id = parsed.searchParams.get('id');
+            if (id && /^\\d+$/.test(id)) return id;
+            const pathParts = parsed.pathname.split('/').filter(Boolean);
+            for (let i = pathParts.length - 1; i >= 0; i--) {{
+                if (/^\\d+$/.test(pathParts[i])) return pathParts[i];
+            }}
+        }} catch (error) {{
+            return null;
+        }}
+        return null;
+    }}
+
+    function findCardRoot(link) {{
+        for (const selector of cardSelectors) {{
+            const card = link.closest(selector);
+            if (card) return card;
+        }}
+        let node = link;
+        for (let i = 0; i < 6 && node; i++) {{
+            if (node.querySelector && node.querySelector('img')) {{
+                return node;
+            }}
+            node = node.parentElement;
+        }}
+        return null;
+    }}
+
+    function applyButtonState(button, workshopId) {{
+        if (downloadedIds.includes(workshopId)) {{
+            button.textContent = '\\u2713';
+            button.title = downloadedTooltip;
+            button.dataset.state = 'downloaded';
+            button.style.background = '#48b64a';
+            button.style.cursor = 'default';
+            return;
+        }}
+        if (queuedIds.includes(workshopId)) {{
+            button.textContent = '\\u2212';
+            button.title = removeTooltip;
+            button.dataset.state = 'queued';
+            button.style.background = '#f5a623';
+            button.style.cursor = 'pointer';
+            return;
+        }}
+        button.textContent = '+';
+        button.title = addTooltip;
+        button.dataset.state = 'available';
+        button.style.background = '#2f8ef3';
+        button.style.cursor = 'pointer';
+    }}
+
+    function applyOptimisticToggle(button) {{
+        if (button.dataset.state === 'downloaded') {{
+            return;
+        }}
+        if (button.dataset.state === 'queued') {{
+            const queuedIndex = queuedIds.indexOf(button.dataset.workshopId);
+            if (queuedIndex >= 0) {{
+                queuedIds.splice(queuedIndex, 1);
+            }}
+            button.textContent = '+';
+            button.title = addTooltip;
+            button.dataset.state = 'available';
+            button.style.background = '#2f8ef3';
+            button.style.cursor = 'pointer';
+            return;
+        }}
+        if (!queuedIds.includes(button.dataset.workshopId)) {{
+            queuedIds.push(button.dataset.workshopId);
+        }}
+        button.textContent = '\\u2212';
+        button.title = removeTooltip;
+        button.dataset.state = 'queued';
+        button.style.background = '#f5a623';
+        button.style.cursor = 'pointer';
+    }}
+
+    function createButton(card, workshopId) {{
+        let button = card.querySelector('.stellaris-queue-button');
+        if (!button) {{
+            if (getComputedStyle(card).position === 'static') {{
+                card.style.position = 'relative';
+            }}
+            button = document.createElement('button');
+            button.className = 'stellaris-queue-button';
+            button.type = 'button';
+            button.style.position = 'absolute';
+            button.style.top = '8px';
+            button.style.right = '8px';
+            button.style.width = '34px';
+            button.style.height = '34px';
+            button.style.border = '0';
+            button.style.borderRadius = '10px';
+            button.style.boxShadow = '0 6px 18px rgba(0,0,0,0.35)';
+            button.style.color = '#ffffff';
+            button.style.fontSize = '20px';
+            button.style.fontWeight = '700';
+            button.style.lineHeight = '1';
+            button.style.zIndex = '9999';
+            button.style.display = 'flex';
+            button.style.alignItems = 'center';
+            button.style.justifyContent = 'center';
+            button.style.opacity = '0';
+            button.style.pointerEvents = 'auto';
+            button.style.transition = 'transform 0.15s ease, opacity 0.15s ease';
+            card.addEventListener('mouseenter', function() {{
+                button.style.opacity = '0.94';
+            }});
+            card.addEventListener('mouseleave', function() {{
+                button.style.opacity = '0';
+                button.style.transform = 'scale(1)';
+            }});
+            button.onmouseenter = () => {{ button.style.transform = 'scale(1.06)'; button.style.opacity = '1'; }};
+            button.onmouseleave = () => {{ button.style.transform = 'scale(1)'; button.style.opacity = '0.94'; }};
+            button.addEventListener('click', function(event) {{
+                event.preventDefault();
+                event.stopPropagation();
+                if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+                if (button.dataset.state === 'downloaded') return;
+                applyOptimisticToggle(button);
+                requestToggle(workshopId);
+            }});
+            card.appendChild(button);
+        }}
+        button.dataset.workshopId = workshopId;
+        applyButtonState(button, workshopId);
+    }}
+
+    function injectButtons() {{
+        const links = document.querySelectorAll(linkSelector);
+        links.forEach((link) => {{
+            const workshopId = extractWorkshopId(link.href);
+            if (!workshopId) return;
+            const card = findCardRoot(link);
+            if (!card) return;
+            createButton(card, workshopId);
+        }});
+    }}
+
+    injectButtons();
+    ensureBridge(function() {{
+        injectButtons();
+    }});
+    if (!window.__stellarisQueueObserver) {{
+        window.__stellarisQueueObserver = new MutationObserver(function() {{
+            injectButtons();
+        }});
+        window.__stellarisQueueObserver.observe(document.body, {{
+            childList: true,
+            subtree: true
+        }});
+    }}
+    window.__stellarisInjectButtons = injectButtons;
+    setTimeout(injectButtons, 300);
+    setTimeout(injectButtons, 1000);
+    setTimeout(injectButtons, 2000);
+}})();
+"""
+
+    def sync_browser_queue_state(self):
+        if not self.browser_view:
+            return
+        self.browser_view.page().runJavaScript(self.get_queue_sync_script())
+
+    def on_browser_load_finished(self, _ok):
+        self.sync_browser_queue_state()
+
+    def update_queue_ui(self):
+        self.queue_list.clear()
+        for wid in self.queue:
+            item = QListWidgetItem(
+                tr("label_queue_item").format(
+                    title=self.queue_titles.get(wid, tr("unknown_mod")),
+                    workshop_id=wid
+                )
+            )
+            item.setData(Qt.UserRole, wid)
+            self.queue_list.addItem(item)
+        self.queue_label.setText(f"{tr('label_selected_mods')} ({len(self.queue)})")
+        self.sync_browser_queue_state()
+
+    def ensure_queue_title_async(self, workshop_id):
+        if self.queue_titles.get(workshop_id) not in {None, tr("unknown_mod")}:
+            return
+        if workshop_id in self.title_lookup_threads:
+            return
+
+        db_path = self.parent_window.db_path if self.parent_window else None
+        worker = WorkshopTitleLookupThread(workshop_id, db_path)
+        worker.resolved.connect(self.on_queue_title_resolved)
+        worker.finished.connect(lambda wid=workshop_id: self.title_lookup_threads.pop(wid, None))
+        self.title_lookup_threads[workshop_id] = worker
+        worker.start()
+
+    def on_queue_title_resolved(self, workshop_id, title):
+        self.queue_titles[workshop_id] = title or tr("unknown_mod")
+        if workshop_id in self.queue:
+            self.update_queue_ui()
+
+    def on_browser_url_changed(self, url):
+        self.url_edit.setText(url.toString())
+        self.current_workshop_id = self.extract_mod_page_workshop_id(url)
+        self.update_current_mod_state()
+
+    def on_browser_title_changed(self, title):
+        self.page_title_label.setText(f"{tr('label_current_page')}: {title or self.WORKSHOP_URL}")
+
+    def go_back(self):
+        self.browser_view.back()
+
+    def go_forward(self):
+        self.browser_view.forward()
+
+    def reload_page(self):
+        self.browser_view.reload()
+
+    def add_current_mod(self):
+        if not self.current_workshop_id:
+            QMessageBox.warning(
+                self,
+                tr("warning_invalid_workshop_page_title"),
+                tr("warning_invalid_workshop_page_message")
+            )
+            return
+
+        if self.current_workshop_id in self.queue:
+            QMessageBox.information(
+                self,
+                tr("info_duplicate_title"),
+                tr("info_duplicate_message").format(workshop_id=self.current_workshop_id)
+            )
+            return
+
+        self.queue.append(self.current_workshop_id)
+        self.queue_titles.setdefault(self.current_workshop_id, tr("unknown_mod"))
+        self.update_queue_ui()
+        self.ensure_queue_title_async(self.current_workshop_id)
+
+    def toggle_queue_item_from_js(self, workshop_id):
+        if workshop_id in self.queue:
+            self.queue = [queue_id for queue_id in self.queue if queue_id != workshop_id]
+            self.update_queue_ui()
+            return
+
+        self.queue.append(workshop_id)
+        self.queue_titles.setdefault(workshop_id, tr("unknown_mod"))
+        self.update_queue_ui()
+        self.ensure_queue_title_async(workshop_id)
+
+    def remove_selected(self):
+        for item in self.queue_list.selectedItems():
+            wid = item.data(Qt.UserRole)
+            if wid in self.queue:
+                self.queue.remove(wid)
+        self.update_queue_ui()
+
+    def clear_list(self):
+        self.queue = []
+        self.update_queue_ui()
+
+    def show_queue_context_menu(self, position):
+        item = self.queue_list.itemAt(position)
+        if not item:
+            return
+
+        selected_items = self.queue_list.selectedItems()
+        selected_ids = [selected_item.data(Qt.UserRole) for selected_item in selected_items]
+        wid = item.data(Qt.UserRole)
+        remove_ids = [wid]
+        remove_label = tr("button_remove_this_mod")
+        if len(selected_ids) > 1 and wid in selected_ids:
+            remove_ids = selected_ids
+            remove_label = tr("button_remove_selected_mods")
+
+        menu = QMenu(self)
+        remove_action = menu.addAction(remove_label)
+        chosen_action = menu.exec(self.queue_list.mapToGlobal(position))
+        if chosen_action == remove_action:
+            self.queue = [queue_id for queue_id in self.queue if queue_id not in remove_ids]
+            self.update_queue_ui()
+
+    def download_queue(self):
+        if not self.queue:
+            QMessageBox.information(self, tr("info_no_mods_title"), tr("info_browser_queue_empty"))
+            return
+        self.parent_window.start_download_for_ids(self.queue.copy())
+        self.queue = []
+        self.update_queue_ui()
 
 
 class CheckUpdatesDialog(QDialog):
@@ -1166,6 +1987,10 @@ class MainWindow(QMainWindow):
         download_action = QAction(tr('menu_download_from_url_id'), self)
         download_action.triggered.connect(self.show_download_from_url_or_id)
         workshop_menu.addAction(download_action)
+
+        browse_workshop_action = QAction(tr('menu_browse_workshop'), self)
+        browse_workshop_action.triggered.connect(self.show_workshop_browser)
+        workshop_menu.addAction(browse_workshop_action)
         
         check_updates_action = QAction(tr('menu_check_updates'), self)
         check_updates_action.triggered.connect(self.show_check_updates)
@@ -1181,6 +2006,11 @@ class MainWindow(QMainWindow):
     def show_download_from_url_or_id(self):
         """Show the unified download dialog for URL/ID."""
         dialog = DownloadFromUrlIdDialog(self)
+        dialog.exec()
+        self.refresh_mod_list()
+
+    def show_workshop_browser(self):
+        dialog = WorkshopBrowserDialog(self)
         dialog.exec()
         self.refresh_mod_list()
 
