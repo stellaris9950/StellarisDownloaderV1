@@ -3,6 +3,7 @@ import logging
 import time
 from pathlib import Path
 from core.database import ModDatabase
+from core.library_root import APP_ID, ensure_junction_target, get_junction_path, get_steamcmd_root
 from core.workshop_api import fetch_mod_metadata
 
 def classify_steamcmd_output(output: str) -> str:
@@ -65,9 +66,9 @@ def download_mod(workshop_id: str, download_root: str, db_path: str) -> dict:
         }
 
     # Dynamically find project root and bundled SteamCMD executable
-    steamcmd_root = Path(__file__).resolve().parent.parent / "steamcmd"
+    steamcmd_root = get_steamcmd_root()
     steamcmd_executable = steamcmd_root / "steamcmd.exe"
-    content_path = steamcmd_root / "steamapps" / "workshop" / "content" / "281990" / workshop_id
+    content_path = steamcmd_root / "steamapps" / "workshop" / "content" / str(APP_ID) / workshop_id
 
     if not steamcmd_executable.exists():
         return {
@@ -85,144 +86,16 @@ def download_mod(workshop_id: str, download_root: str, db_path: str) -> dict:
     cmd = [
         str(steamcmd_executable),
         "+login", "anonymous",
-        "+workshop_download_item", "281990", workshop_id,
+        "+workshop_download_item", str(APP_ID), workshop_id,
         "+quit"
     ]
 
-    # Ensure library root exists
-    Path(download_root).mkdir(parents=True, exist_ok=True)
-
     try:
-        # Set up junction to library root
-        content_281990 = content_path.parent
-        junction_created = False
-        junction_verified = False
-
-        if content_281990.exists():
-            if content_281990.is_dir():
-                # Check if it's already a junction
-                verify_cmd = ['fsutil', 'reparsepoint', 'query', str(content_281990)]
-                verify_result = subprocess.run(verify_cmd, capture_output=True, text=True)
-                if verify_result.returncode == 0:
-                    # It's a junction
-                    junction_verified = True
-
-                    # Verify it points at the requested library target
-                    current_target = content_281990.resolve()
-                    requested_target = Path(download_root).resolve()
-                    if current_target != requested_target:
-                        return {
-                            "status": "failed",
-                            "workshop_id": workshop_id,
-                            "content_path": str(content_path),
-                            "final_path": None,
-                            "folder_exists": False,
-                            "folder_nonempty": False,
-                            "copied_successfully": False,
-                            "junction_created": False,
-                            "junction_verified": False,
-                            "junction_path": str(content_281990),
-                            "library_target_path": download_root,
-                            "title": None,
-                            "remote_updated_at": None,
-                            "return_code": -1,
-                            "stdout": "",
-                            "stderr": "",
-                            "error": f"Existing junction at {content_281990} points to {current_target}, expected {requested_target}."
-                        }
-                else:
-                    # Normal directory
-                    if any(content_281990.iterdir()):
-                        return {
-                            "status": "failed",
-                            "workshop_id": workshop_id,
-                            "content_path": str(content_path),
-                            "final_path": None,
-                            "folder_exists": False,
-                            "folder_nonempty": False,
-                            "copied_successfully": False,
-                            "junction_created": junction_created,
-                            "junction_verified": junction_verified,
-                            "junction_path": str(content_281990),
-                            "library_target_path": download_root,
-                            "return_code": -1,
-                            "stdout": "",
-                            "stderr": "",
-                            "error": "Existing non-empty SteamCMD cache folder found. Remove or migrate it before creating junction."
-                        }
-                    else:
-                        # Empty, remove and create junction
-                        content_281990.rmdir()
-                        junction_created = True
-                        junction_cmd = ['cmd', '/c', 'mklink', '/J', str(content_281990), download_root]
-                        junction_result = subprocess.run(junction_cmd, capture_output=True, text=True)
-                        if junction_result.returncode != 0:
-                            return {
-                                "status": "failed",
-                                "workshop_id": workshop_id,
-                                "content_path": str(content_path),
-                                "final_path": None,
-                                "folder_exists": False,
-                                "folder_nonempty": False,
-                                "copied_successfully": False,
-                                "junction_created": junction_created,
-                                "junction_verified": junction_verified,
-                                "junction_path": str(content_281990),
-                                "library_target_path": download_root,
-                                "return_code": -1,
-                                "stdout": "",
-                                "stderr": "",
-                                "error": f"Failed to create junction: {junction_result.stderr}"
-                            }
-                        # Verify
-                        verify_result = subprocess.run(verify_cmd, capture_output=True, text=True)
-                        junction_verified = verify_result.returncode == 0
-            else:
-                # Exists but not dir? Unlikely, fail
-                return {
-                    "status": "failed",
-                    "workshop_id": workshop_id,
-                    "content_path": str(content_path),
-                    "final_path": None,
-                    "folder_exists": False,
-                    "folder_nonempty": False,
-                    "copied_successfully": False,
-                    "junction_created": junction_created,
-                    "junction_verified": junction_verified,
-                    "junction_path": str(content_281990),
-                    "library_target_path": download_root,
-                    "return_code": -1,
-                    "stdout": "",
-                    "stderr": "",
-                    "error": f"Path {content_281990} exists but is not a directory."
-                }
-        else:
-            # Not exist, create junction
-            junction_created = True
-            junction_cmd = ['cmd', '/c', 'mklink', '/J', str(content_281990), download_root]
-            junction_result = subprocess.run(junction_cmd, capture_output=True, text=True)
-            if junction_result.returncode != 0:
-                return {
-                    "status": "failed",
-                    "workshop_id": workshop_id,
-                    "content_path": str(content_path),
-                    "final_path": None,
-                    "folder_exists": False,
-                    "folder_nonempty": False,
-                    "copied_successfully": False,
-                    "junction_created": junction_created,
-                    "junction_verified": junction_verified,
-                    "junction_path": str(content_281990),
-                    "library_target_path": download_root,
-                    "return_code": -1,
-                    "stdout": "",
-                    "stderr": "",
-                    "error": f"Failed to create junction: {junction_result.stderr}"
-                }
-            # Verify
-            verify_cmd = ['fsutil', 'reparsepoint', 'query', str(content_281990)]
-            verify_result = subprocess.run(verify_cmd, capture_output=True, text=True)
-            junction_verified = verify_result.returncode == 0
+        junction_preexisting = get_junction_path().exists()
+        junction_path = ensure_junction_target(download_root)
+        junction_created = not junction_preexisting
+        junction_verified = junction_path.resolve() == Path(download_root).resolve()
+        content_281990 = get_junction_path()
 
         # Run SteamCMD download
         logging.info(f"Starting download for workshop ID: {workshop_id} using {steamcmd_executable}")
@@ -246,6 +119,11 @@ def download_mod(workshop_id: str, download_root: str, db_path: str) -> dict:
         error = None
         title = None
         remote_updated_at = None
+        description = None
+        preview_url = None
+        creator = None
+        time_created = None
+        file_size = None
 
         # Initialize database and store record
         db = ModDatabase(db_path)
@@ -257,6 +135,11 @@ def download_mod(workshop_id: str, download_root: str, db_path: str) -> dict:
             if metadata:
                 title = metadata.get("title")
                 remote_updated_at = metadata.get("remote_updated_at")
+                description = metadata.get("description")
+                preview_url = metadata.get("preview_url")
+                creator = metadata.get("creator")
+                time_created = metadata.get("time_created")
+                file_size = metadata.get("file_size")
             
             # Compute user library path
             user_library_path = Path(download_root) / workshop_id
@@ -269,6 +152,11 @@ def download_mod(workshop_id: str, download_root: str, db_path: str) -> dict:
                 status="success",
                 title=title,
                 remote_updated_at=remote_updated_at,
+                description=description,
+                preview_url=preview_url,
+                creator=creator,
+                time_created=time_created,
+                file_size=file_size,
                 last_downloaded_at=last_downloaded_at
             )
         else:

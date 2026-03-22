@@ -49,7 +49,7 @@ def resolve_download_root(explicit_root: str = None) -> str:
 def cmd_download(args):
     """Handle download command."""
     try:
-        download_root = resolve_download_root(getattr(args, 'download_root', None))
+        download_root = resolve_download_root(None)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
@@ -125,7 +125,8 @@ def cmd_check_updates(args):
     stats = {
         "up_to_date": 0,
         "update_available": 0,
-        "failed_check": 0
+        "failed_check": 0,
+        "unknown_state": 0
     }
     
     print(f"\n{'Workshop ID':<15} | {'Title':<30} | {'Status':<18} | {'Stored Updated':<20} | {'Latest Updated':<20}")
@@ -207,7 +208,7 @@ def cmd_show_settings(args):
 def cmd_update(args):
     """Handle update command."""
     try:
-        download_root = resolve_download_root(getattr(args, 'download_root', None))
+        download_root = resolve_download_root(None)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
@@ -233,7 +234,7 @@ def cmd_update(args):
 def cmd_update_all(args):
     """Handle update-all command."""
     try:
-        download_root = resolve_download_root(getattr(args, 'download_root', None))
+        download_root = resolve_download_root(None)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
@@ -273,11 +274,6 @@ def main():
         "workshop_id",
         help="The Steam Workshop ID of the mod to download"
     )
-    download_parser.add_argument(
-        "--download-root",
-        required=False,
-        help="The root directory where the downloaded mod should be stored (optional if library root is configured)"
-    )
     download_parser.set_defaults(func=cmd_download)
     
     # List command
@@ -294,20 +290,10 @@ def main():
         'workshop_id',
         help='The Steam Workshop ID of the mod to update'
     )
-    update_parser.add_argument(
-        '--download-root',
-        required=False,
-        help='The root directory where the mod should be stored (optional if library root is configured)'
-    )
     update_parser.set_defaults(func=cmd_update)
 
     # Update-all command
     update_all_parser = subparsers.add_parser('update-all', help='Update all tracked mods with available updates')
-    update_all_parser.add_argument(
-        '--download-root',
-        required=False,
-        help='The root directory where mods should be stored (optional if library root is configured)'
-    )
     update_all_parser.set_defaults(func=cmd_update_all)
     
     # Set library root command

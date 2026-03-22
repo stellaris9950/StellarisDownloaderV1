@@ -12,8 +12,7 @@ def fetch_mod_metadata(workshop_id: str) -> Optional[Dict]:
         workshop_id: Steam Workshop ID
 
     Returns:
-        Optional[Dict]: Dictionary with 'title' and 'remote_updated_at' (Unix timestamp),
-                        or None if fetch fails.
+        Optional[Dict]: Dictionary with mod metadata, or None if fetch fails.
     """
     try:
         data = {
@@ -38,19 +37,32 @@ def fetch_mod_metadata(workshop_id: str) -> Optional[Dict]:
             logging.warning(f"Invalid or failed file details result for {workshop_id}: {file_details}")
             return None
 
-        title = file_details.get("title")
-        remote_updated_at = file_details.get("time_updated")
-
-        if title is None or remote_updated_at is None:
-            logging.warning(f"Missing title or time_updated for {workshop_id}")
+        # Extract available metadata
+        metadata = {
+            "title": file_details.get("title"),
+            "description": file_details.get("description"),
+            "preview_url": file_details.get("preview_url"),
+            "creator": file_details.get("creator"),
+            "remote_updated_at": file_details.get("time_updated"),
+            "time_created": file_details.get("time_created"),
+            "tags": file_details.get("tags", []),
+            "file_size": file_details.get("file_size"),
+        }
+        
+        # Validate required fields
+        if metadata["title"] is None or metadata["remote_updated_at"] is None:
+            logging.warning(f"Missing required fields for {workshop_id}")
             return None
         
-        logging.info(f"Successfully fetched metadata for {workshop_id}: title='{title}', time_updated={remote_updated_at}")
+        # Convert timestamps to int
+        if metadata["remote_updated_at"]:
+            metadata["remote_updated_at"] = int(metadata["remote_updated_at"])
+        if metadata["time_created"]:
+            metadata["time_created"] = int(metadata["time_created"])
         
-        return {
-            "title": title,
-            "remote_updated_at": int(remote_updated_at)
-        }
+        logging.info(f"Successfully fetched metadata for {workshop_id}: title='{metadata['title']}'")
+        
+        return metadata
     except requests.exceptions.RequestException as e:
         logging.error(f"Request error fetching metadata for {workshop_id}: {str(e)}")
         return None

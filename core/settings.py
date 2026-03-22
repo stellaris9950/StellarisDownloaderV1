@@ -49,15 +49,31 @@ class SettingsManager:
     
     def set_library_root(self, library_root: str) -> None:
         """Set library root and save."""
-        # Validate path exists
         path = Path(library_root)
-        if not path.exists():
-            raise ValueError(f"Library root path does not exist: {library_root}")
-        
+        path.mkdir(parents=True, exist_ok=True)
+
         settings = self._load_settings()
         settings['library_root'] = str(path.resolve())
         self._save_settings(settings)
         logging.info(f"Library root set to: {settings['library_root']}")
+
+    def get_language(self) -> str:
+        """Get stored UI language, defaulting to English."""
+        settings = self._load_settings()
+        language = settings.get('language', 'en')
+        if language not in {'en', 'zh'}:
+            return 'en'
+        return language
+
+    def set_language(self, lang_code: str) -> None:
+        """Set UI language and save."""
+        if lang_code not in {'en', 'zh'}:
+            raise ValueError(f"Unsupported language code: {lang_code}")
+
+        settings = self._load_settings()
+        settings['language'] = lang_code
+        self._save_settings(settings)
+        logging.info(f"Language set to: {lang_code}")
     
     def get_all_settings(self) -> Dict:
         """Get all settings."""
