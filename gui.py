@@ -1,3 +1,4 @@
+import logging
 import sys
 import os
 import json
@@ -15,12 +16,14 @@ from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebChannel import QWebChannel
 
+from core.app_updater import UpdateError, check_for_updates, download_release_asset, launch_updater_for_package
 from core.database import ModDatabase
 from core.i18n import tr
-from core.library_root import switch_library_root, validate_library_root
+from core.library_root import rebuild_database_from_library_root, switch_library_root, validate_library_root
 from core.runtime_paths import configure_logging, get_db_path, get_settings_path
 from core.settings import SettingsManager
 from core.updater import check_all_mods_for_updates, update_mod, update_all_mods
+from core.version import __version__
 from core.steamcmd import download_mod
 from core.workshop_api import fetch_mod_metadata
 
@@ -48,6 +51,37 @@ class WorkshopTitleLookupThread(QThread):
     def run(self):
         title = resolve_workshop_title(self.workshop_id, self.db_path)
         self.resolved.emit(self.workshop_id, title)
+
+
+class AppUpdateCheckThread(QThread):
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def run(self):
+        try:
+            self.finished.emit(check_for_updates())
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class AppUpdateDownloadThread(QThread):
+    progress = Signal(int, int)
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, release_info):
+        super().__init__()
+        self.release_info = release_info
+
+    def run(self):
+        try:
+            path = download_release_asset(
+                self.release_info,
+                progress_callback=lambda current, total: self.progress.emit(current, total),
+            )
+            self.finished.emit(str(path))
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class WorkshopQueueBridge(QObject):
@@ -1228,6 +1262,7 @@ class SettingsDialog(QDialog):
         self.original_settings = {
             "library_root": "",
             "language": "en",
+            "refresh_mod_db_on_startup": False,
         }
         
         layout = QVBoxLayout()
@@ -1250,6 +1285,16 @@ class SettingsDialog(QDialog):
         self.language_combo.addItem(tr("language_simplified_chinese"), "zh")
         self.language_combo.currentIndexChanged.connect(self.on_language_changed)
         form_layout.addRow(tr("label_language"), self.language_combo)
+
+        startup_section_spacer = QWidget()
+        startup_section_spacer.setFixedHeight(12)
+        form_layout.addRow("", startup_section_spacer)
+
+        self.refresh_mod_db_checkbox = QCheckBox(tr("label_refresh_mod_db_on_startup"))
+        form_layout.addRow(tr("label_startup"), self.refresh_mod_db_checkbox)
+        self.refresh_mod_db_warning_label = QLabel(tr("label_refresh_mod_db_on_startup_warning"))
+        self.refresh_mod_db_warning_label.setWordWrap(True)
+        form_layout.addRow("", self.refresh_mod_db_warning_label)
         
         layout.addLayout(form_layout)
         
@@ -1261,6 +1306,9 @@ class SettingsDialog(QDialog):
         current_language = settings.get_language()
         self.original_settings["language"] = current_language
         self.language_combo.setCurrentIndex(max(self.language_combo.findData(current_language), 0))
+        refresh_mod_db_on_startup = settings.get_refresh_mod_db_on_startup()
+        self.original_settings["refresh_mod_db_on_startup"] = refresh_mod_db_on_startup
+        self.refresh_mod_db_checkbox.setChecked(refresh_mod_db_on_startup)
         
         buttons = QDialogButtonBox(
             QDialogButtonBox.Save | QDialogButtonBox.Cancel,
@@ -1293,6 +1341,7 @@ class SettingsDialog(QDialog):
         return {
             "library_root": self.normalize_root_text(self.library_root_edit.text()),
             "language": self.language_combo.currentData(),
+            "refresh_mod_db_on_startup": self.refresh_mod_db_checkbox.isChecked(),
         }
 
     def has_library_root_changed(self):
@@ -1351,9 +1400,13 @@ class SettingsDialog(QDialog):
             current_settings = self.get_current_settings_state()
             new_root = current_settings["library_root"]
             new_language = current_settings["language"]
+            new_refresh_mod_db_on_startup = current_settings["refresh_mod_db_on_startup"]
             changed = self.has_settings_changed()
             library_root_changed = new_root != self.original_settings["library_root"]
             language_changed = new_language != self.original_settings["language"]
+            refresh_mod_db_on_startup_changed = (
+                new_refresh_mod_db_on_startup != self.original_settings["refresh_mod_db_on_startup"]
+            )
 
             if not new_root and self.original_settings["library_root"]:
                 QMessageBox.warning(self, tr("warning_invalid_setting_title"), tr("warning_library_root_empty"))
@@ -1372,25 +1425,79 @@ class SettingsDialog(QDialog):
 
             parent_window = self.parent()
             db_path = parent_window.db_path if hasattr(parent_window, "db_path") else get_db_path()
-            imported_count = 0
             if library_root_changed and new_root:
-                result = switch_library_root(get_settings_path(), db_path, new_root)
-                imported_count = result.get('imported_count', 0)
-            if language_changed:
-                SettingsManager(get_settings_path()).set_language(new_language)
+                progress_dialog = OperationProgressDialog(tr("dialog_loading_library"), self)
+                progress_dialog.set_overall(0, 0)
+                progress_dialog.set_current(tr("status_scanning_library_root"))
+                progress_dialog.show()
+
+                worker = SwitchLibraryRootThread(get_settings_path(), db_path, new_root)
+                worker.progress.connect(
+                    lambda done, total, current: [
+                        progress_dialog.set_overall(done, total),
+                        progress_dialog.set_current(current),
+                    ]
+                )
+                worker.log.connect(progress_dialog.append_log)
+
+                def on_finished(result):
+                    progress_dialog.append_log(
+                        tr("log_loading_library_complete").format(count=result.get("imported_count", 0))
+                    )
+                    progress_dialog.mark_done()
+                    self.apply_non_root_settings_changes(
+                        new_language,
+                        language_changed,
+                        new_refresh_mod_db_on_startup,
+                        refresh_mod_db_on_startup_changed,
+                    )
+                    self.root_changed = True
+                    self.original_settings = current_settings
+                    QMessageBox.information(
+                        self,
+                        tr("info_settings_saved_title"),
+                        tr("info_settings_saved_message").format(count=result.get("imported_count", 0))
+                    )
+                    progress_dialog.close()
+                    self.accept()
+
+                def on_error(error_message):
+                    progress_dialog.close()
+                    QMessageBox.critical(
+                        self,
+                        tr("error_title"),
+                        tr("error_save_settings_message").format(error=error_message),
+                    )
+
+                worker.finished.connect(on_finished)
+                worker.error.connect(on_error)
+                self._switch_root_worker = worker
+                worker.start()
+                return
+
+            self.apply_non_root_settings_changes(
+                new_language,
+                language_changed,
+                new_refresh_mod_db_on_startup,
+                refresh_mod_db_on_startup_changed,
+            )
             self.root_changed = library_root_changed
             self.original_settings = current_settings
-            saved_message = tr("info_settings_saved_simple")
-            if library_root_changed and new_root:
-                saved_message = tr("info_settings_saved_message").format(count=imported_count)
             QMessageBox.information(
                 self,
                 tr("info_settings_saved_title"),
-                saved_message
+                tr("info_settings_saved_simple")
             )
             self.accept()
         except Exception as e:
             QMessageBox.critical(self, tr("error_title"), tr("error_save_settings_message").format(error=e))
+
+    def apply_non_root_settings_changes(self, new_language, language_changed, new_refresh_mod_db_on_startup, refresh_mod_db_on_startup_changed):
+        settings_manager = SettingsManager(get_settings_path())
+        if language_changed:
+            settings_manager.set_language(new_language)
+        if refresh_mod_db_on_startup_changed:
+            settings_manager.set_refresh_mod_db_on_startup(new_refresh_mod_db_on_startup)
 
 class UpdateCheckThread(QThread):
     """Thread for checking mod updates."""
@@ -1483,6 +1590,78 @@ class UpdateModsThread(QThread):
                     self.log.emit(f"{workshop_id} update raised exception: {e}")
                 self.progress.emit(index, total, f"Completed {workshop_id}")
             self.finished.emit({"updated": updated, "failed": failed, "details": details})
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class StartupLibraryRefreshThread(QThread):
+    progress = Signal(int, int, str)
+    log = Signal(str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, db_path, library_root):
+        super().__init__()
+        self.db_path = db_path
+        self.library_root = library_root
+
+    def run(self):
+        try:
+            def on_progress(current, total, token):
+                if token == "scan_started":
+                    current_text = tr("status_scanning_library_root")
+                else:
+                    current_text = tr("status_loading_library_mod").format(workshop_id=token)
+                self.progress.emit(current, total, current_text)
+
+            def on_log(workshop_id):
+                self.log.emit(tr("status_loading_library_mod").format(workshop_id=workshop_id))
+
+            result = rebuild_database_from_library_root(
+                self.db_path,
+                self.library_root,
+                progress_callback=on_progress,
+                log_callback=on_log,
+            )
+            self.log.emit(tr("log_loading_library_rebuilding_database"))
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class SwitchLibraryRootThread(QThread):
+    progress = Signal(int, int, str)
+    log = Signal(str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, settings_path, db_path, new_library_root):
+        super().__init__()
+        self.settings_path = settings_path
+        self.db_path = db_path
+        self.new_library_root = new_library_root
+
+    def run(self):
+        try:
+            def on_progress(current, total, token):
+                if token == "scan_started":
+                    current_text = tr("status_scanning_library_root")
+                else:
+                    current_text = tr("status_loading_library_mod").format(workshop_id=token)
+                self.progress.emit(current, total, current_text)
+
+            def on_log(workshop_id):
+                self.log.emit(tr("status_loading_library_mod").format(workshop_id=workshop_id))
+
+            result = switch_library_root(
+                self.settings_path,
+                self.db_path,
+                self.new_library_root,
+                progress_callback=on_progress,
+                log_callback=on_log,
+            )
+            self.log.emit(tr("log_loading_library_rebuilding_database"))
+            self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -1915,6 +2094,7 @@ class MainWindow(QMainWindow):
         self.worker_threads = []
         self.init_ui()
         self.refresh_mod_list()
+        QTimer.singleShot(0, self.refresh_mod_db_on_startup_if_enabled)
     
     def init_ui(self):
         """Initialize the user interface."""
@@ -2009,6 +2189,10 @@ class MainWindow(QMainWindow):
         settings_action = QAction(tr('menu_settings'), self)
         settings_action.triggered.connect(self.show_settings)
         settings_menu.addAction(settings_action)
+
+        check_app_updates_action = QAction(tr('menu_check_app_updates'), self)
+        check_app_updates_action.triggered.connect(self.show_app_update_check)
+        settings_menu.addAction(check_app_updates_action)
     
     def show_download_from_url_or_id(self):
         """Show the unified download dialog for URL/ID."""
@@ -2256,6 +2440,173 @@ class MainWindow(QMainWindow):
             self.refresh_mod_list()
             return True
         return False
+
+    @staticmethod
+    def summarize_release_notes(notes, max_length=600):
+        notes = (notes or "").strip()
+        if not notes:
+            return ""
+        if len(notes) <= max_length:
+            return notes
+        return notes[:max_length].rstrip() + "..."
+
+    def show_app_update_check(self):
+        progress_dialog = OperationProgressDialog(tr("dialog_checking_updates"), self)
+        progress_dialog.set_overall(0, 0)
+        progress_dialog.set_current(tr("dialog_checking_updates"))
+        progress_dialog.show()
+
+        worker = AppUpdateCheckThread()
+
+        def on_finished(result):
+            progress_dialog.mark_done()
+            progress_dialog.close()
+            release = result["release"]
+            if not result["update_available"]:
+                QMessageBox.information(
+                    self,
+                    tr("dialog_app_up_to_date"),
+                    tr("info_app_is_up_to_date_message"),
+                )
+                return
+
+            message_box = QMessageBox(self)
+            message_box.setIcon(QMessageBox.Information)
+            message_box.setWindowTitle(tr("dialog_app_update_available"))
+            message_box.setText(
+                tr("info_app_update_available_message").format(
+                    current_version=result["current_version"],
+                    latest_version=result["latest_version"],
+                )
+            )
+            informative_text = tr("info_update_will_restart_message")
+            notes_summary = self.summarize_release_notes(release.notes)
+            if notes_summary:
+                informative_text += f"\n\n{tr('info_app_update_notes_label')}\n{notes_summary}"
+                message_box.setDetailedText(release.notes)
+            message_box.setInformativeText(informative_text)
+            update_now_button = message_box.addButton(tr("button_update_now"), QMessageBox.AcceptRole)
+            message_box.addButton(tr("button_later"), QMessageBox.RejectRole)
+            message_box.exec()
+
+            if message_box.clickedButton() == update_now_button:
+                self.start_app_update_download(release)
+
+        def on_error(error_message):
+            progress_dialog.close()
+            QMessageBox.warning(
+                self,
+                tr("dialog_app_update_error"),
+                tr("error_update_check_failed_message").format(error=error_message),
+            )
+
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        self.worker_threads.append(worker)
+        worker.start()
+
+    def start_app_update_download(self, release):
+        progress_dialog = OperationProgressDialog(tr("dialog_downloading_update"), self)
+        progress_dialog.set_overall(0, 0)
+        progress_dialog.set_current(tr("status_downloading_update"))
+        progress_dialog.show()
+
+        worker = AppUpdateDownloadThread(release)
+
+        def on_progress(downloaded, total):
+            progress_dialog.set_overall(downloaded, total)
+            if total > 0:
+                progress_dialog.set_current(
+                    tr("status_update_download_progress").format(
+                        current_mb=downloaded / (1024 * 1024),
+                        total_mb=total / (1024 * 1024),
+                    )
+                )
+            else:
+                progress_dialog.set_current(tr("status_downloading_update"))
+
+        def on_finished(package_path):
+            progress_dialog.append_log(tr("log_update_package_downloaded").format(path=package_path))
+            progress_dialog.mark_done()
+            try:
+                launch_updater_for_package(Path(package_path))
+            except UpdateError as exc:
+                progress_dialog.close()
+                QMessageBox.critical(
+                    self,
+                    tr("dialog_app_update_error"),
+                    tr("error_updater_launch_failed_message").format(error=exc),
+                )
+                return
+
+            progress_dialog.close()
+            QApplication.instance().quit()
+
+        def on_error(error_message):
+            progress_dialog.close()
+            QMessageBox.warning(
+                self,
+                tr("dialog_app_update_error"),
+                tr("error_update_download_failed_message").format(error=error_message),
+            )
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        self.worker_threads.append(worker)
+        worker.start()
+
+    def refresh_mod_db_on_startup_if_enabled(self):
+        settings = SettingsManager(self.settings_path)
+        if not settings.get_refresh_mod_db_on_startup():
+            return
+
+        library_root = settings.get_library_root()
+        is_valid, detail = validate_library_root(library_root)
+        if not is_valid or not library_root:
+            if detail:
+                logging.info(f"Skipping startup mod database refresh: {detail}")
+            return
+
+        self.mod_list.clear()
+        self.all_mods = []
+        self.detail_panel.clear_details()
+
+        progress_dialog = OperationProgressDialog(tr("dialog_loading_library"), self)
+        progress_dialog.set_overall(0, 0)
+        progress_dialog.set_current(tr("status_scanning_library_root"))
+        progress_dialog.show()
+
+        worker = StartupLibraryRefreshThread(self.db_path, library_root)
+        worker.progress.connect(
+            lambda done, total, current: [
+                progress_dialog.set_overall(done, total),
+                progress_dialog.set_current(current),
+            ]
+        )
+        worker.log.connect(progress_dialog.append_log)
+
+        def on_finished(result):
+            progress_dialog.append_log(
+                tr("log_loading_library_complete").format(count=result.get("imported_count", 0))
+            )
+            progress_dialog.mark_done()
+            self.refresh_mod_list()
+            progress_dialog.close()
+
+        def on_error(error_message):
+            logging.error("Startup mod database refresh failed: %s", error_message)
+            progress_dialog.close()
+            QMessageBox.warning(
+                self,
+                tr("error_title"),
+                tr("error_startup_refresh_mod_db_message").format(error=error_message),
+            )
+
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        self.worker_threads.append(worker)
+        worker.start()
     
     def refresh_mod_list(self):
         """Refresh the mod list from database."""
@@ -2346,7 +2697,7 @@ def main():
     
     # Set application properties
     app.setApplicationName(tr("app_title"))
-    app.setApplicationVersion("1.0")
+    app.setApplicationVersion(__version__)
     app.setOrganizationName(tr("app_title"))
     
     window = MainWindow()

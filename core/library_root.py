@@ -1,7 +1,7 @@
 import logging
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from core.database import ModDatabase
 from core.runtime_paths import get_runtime_steamcmd_root
@@ -135,17 +135,31 @@ def validate_library_root(library_root: Optional[str]) -> Tuple[bool, str]:
     return True, ""
 
 
-def build_import_records(library_root: str) -> List[Dict]:
+def build_import_records(
+    library_root: str,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> List[Dict]:
     root_path = normalize_library_root(library_root)
     if not root_path.exists():
         return []
 
-    records: List[Dict] = []
-    for child in sorted(root_path.iterdir(), key=lambda path: path.name):
-        if not child.is_dir() or not child.name.isdigit():
-            continue
+    mod_folders = [
+        child for child in sorted(root_path.iterdir(), key=lambda path: path.name)
+        if child.is_dir() and child.name.isdigit()
+    ]
+    total = len(mod_folders)
+    if progress_callback:
+        progress_callback(0, total, "scan_started")
 
+    records: List[Dict] = []
+    for index, child in enumerate(mod_folders, start=1):
         workshop_id = child.name
+        if progress_callback:
+            progress_callback(index, total, workshop_id)
+        if log_callback:
+            log_callback(workshop_id)
+
         last_downloaded_at = int(child.stat().st_mtime)
         metadata = fetch_mod_metadata(workshop_id) or {}
 
@@ -168,8 +182,17 @@ def build_import_records(library_root: str) -> List[Dict]:
     return records
 
 
-def rebuild_database_from_library_root(db_path: str, library_root: str) -> Dict:
-    records = build_import_records(library_root)
+def rebuild_database_from_library_root(
+    db_path: str,
+    library_root: str,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> Dict:
+    records = build_import_records(
+        library_root,
+        progress_callback=progress_callback,
+        log_callback=log_callback,
+    )
     db = ModDatabase(db_path)
     if not db.replace_all_mods(records):
         raise RuntimeError("Failed to rebuild database from the selected library root.")
@@ -179,7 +202,13 @@ def rebuild_database_from_library_root(db_path: str, library_root: str) -> Dict:
     }
 
 
-def switch_library_root(settings_path: str, db_path: str, new_library_root: str) -> Dict:
+def switch_library_root(
+    settings_path: str,
+    db_path: str,
+    new_library_root: str,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
+) -> Dict:
     settings = SettingsManager(settings_path)
     previous_root_raw = settings.get_library_root()
     previous_root = normalize_library_root(previous_root_raw) if previous_root_raw else None
@@ -191,7 +220,12 @@ def switch_library_root(settings_path: str, db_path: str, new_library_root: str)
 
     if previous_root and previous_root == new_root:
         ensure_junction_target(str(new_root))
-        rebuild_result = rebuild_database_from_library_root(db_path, str(new_root))
+        rebuild_result = rebuild_database_from_library_root(
+            db_path,
+            str(new_root),
+            progress_callback=progress_callback,
+            log_callback=log_callback,
+        )
         settings.set_library_root(str(new_root))
         return {
             "library_root": str(new_root),
@@ -217,7 +251,12 @@ def switch_library_root(settings_path: str, db_path: str, new_library_root: str)
                 f"Junction verification failed after switch: {junction_path} -> {verified_target}"
             )
 
-        rebuild_result = rebuild_database_from_library_root(db_path, str(new_root))
+        rebuild_result = rebuild_database_from_library_root(
+            db_path,
+            str(new_root),
+            progress_callback=progress_callback,
+            log_callback=log_callback,
+        )
         settings.set_library_root(str(new_root))
         return {
             "library_root": str(new_root),

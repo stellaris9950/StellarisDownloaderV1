@@ -29,6 +29,13 @@ The packaged app is created in:
 dist\StellarisModManager\
 ```
 
+The one-folder package now contains:
+
+- `StellarisModManager.exe`
+- `StellarisModManagerUpdater.exe`
+- Qt/PySide runtime files
+- `steamcmd\steamcmd.exe`
+
 Run it with:
 
 ```powershell
@@ -51,6 +58,8 @@ Within that folder it creates:
 - `data\settings.json`
 - `logs\app.log`
 - `steamcmd\...` runtime SteamCMD copy
+- `updates\downloads\...` downloaded app update packages
+- `updates\staging\...` temporary updater helper/runtime files
 
 This means the packaged build can run from a read-only location such as:
 
@@ -84,6 +93,23 @@ The spec file uses PyInstaller collection helpers for `PySide6`, including:
 - `PySide6.QtWebChannel`
 
 That ensures the embedded Workshop browser and Qt WebEngine runtime are included in the one-folder build.
+
+## Self-update packaging
+
+The packaged build includes a separate updater helper executable:
+
+- `StellarisModManagerUpdater.exe`
+
+The main app downloads GitHub release zip packages into `%LOCALAPPDATA%\StellarisModManager\updates`.
+It then launches the updater helper from that writable location, exits, and lets the helper replace the install folder safely before restarting the app.
+
+Expected release asset format:
+
+- a zip file
+- preferred asset name: `StellarisModManager.zip`
+- containing a top-level folder such as `stellarismodmanager`
+- with `StellarisModManager.exe` somewhere inside that folder tree
+- the updater does not touch `%LOCALAPPDATA%\StellarisModManager\data`, `logs`, `steamcmd`, or other user data outside the install folder
 
 ## Test process
 

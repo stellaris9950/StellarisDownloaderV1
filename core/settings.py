@@ -74,6 +74,18 @@ class SettingsManager:
         settings['language'] = lang_code
         self._save_settings(settings)
         logging.info(f"Language set to: {lang_code}")
+
+    def get_refresh_mod_db_on_startup(self) -> bool:
+        """Get whether the mod database should be refreshed on startup."""
+        settings = self._load_settings()
+        return bool(settings.get('refresh_mod_db_on_startup', False))
+
+    def set_refresh_mod_db_on_startup(self, enabled: bool) -> None:
+        """Set whether the mod database should be refreshed on startup."""
+        settings = self._load_settings()
+        settings['refresh_mod_db_on_startup'] = bool(enabled)
+        self._save_settings(settings)
+        logging.info(f"refresh_mod_db_on_startup set to: {bool(enabled)}")
     
     def get_all_settings(self) -> Dict:
         """Get all settings."""

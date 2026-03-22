@@ -5,6 +5,8 @@ from pathlib import Path
 
 
 APP_DIR_NAME = "StellarisModManager"
+
+
 def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
@@ -41,6 +43,24 @@ def get_data_dir() -> Path:
     return path
 
 
+def get_updates_dir() -> Path:
+    path = get_user_data_root() / "updates"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_update_downloads_dir() -> Path:
+    path = get_updates_dir() / "downloads"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_update_staging_dir() -> Path:
+    path = get_updates_dir() / "staging"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def get_db_path() -> str:
     return str(get_data_dir() / "app.db")
 
@@ -51,6 +71,12 @@ def get_settings_path() -> str:
 
 def get_bundled_steamcmd_root() -> Path:
     return get_bundle_root() / "steamcmd"
+
+
+def get_install_root() -> Path:
+    if is_frozen():
+        return Path(sys.executable).resolve().parent
+    return get_bundle_root()
 
 
 def _ensure_runtime_steamcmd_layout(runtime_root: Path) -> None:
