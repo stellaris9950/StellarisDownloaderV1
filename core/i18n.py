@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from core.runtime_paths import get_settings_path as runtime_settings_path
 from core.settings import SettingsManager
 
 
@@ -272,7 +273,7 @@ TRANSLATIONS = {
 
 
 def get_settings_path() -> str:
-    return str(Path(__file__).resolve().parent.parent / "data" / "settings.json")
+    return runtime_settings_path()
 
 
 def get_language() -> str:

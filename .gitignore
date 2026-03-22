@@ -9,10 +9,14 @@ __pycache__/
 *.pyc
 
 # Database
-data/app.db
+data/
 
 # Logs
 logs/
+
+# Build output
+build/
+dist/
 
 # OS
 .DS_Store

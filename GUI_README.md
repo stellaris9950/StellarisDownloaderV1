@@ -26,6 +26,36 @@ A desktop GUI for managing Stellaris Steam Workshop mods.
 python gui.py
 ```
 
+## Windows Packaging
+
+The app can be packaged for machines without Python by using PyInstaller in one-folder mode.
+
+Build:
+
+```powershell
+pip install pyinstaller
+.\build_windows.ps1
+```
+
+Output:
+
+```text
+dist\StellarisModManager\
+```
+
+The packaged app stores writable runtime data under:
+
+```text
+%LOCALAPPDATA%\StellarisModManager\
+```
+
+This includes:
+
+- `data\settings.json`
+- `data\app.db`
+- `logs\app.log`
+- `steamcmd\...`
+
 ## GUI Layout
 
 ### Right Pane: Mod Browser

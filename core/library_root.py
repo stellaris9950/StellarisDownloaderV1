@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from core.database import ModDatabase
+from core.runtime_paths import get_runtime_steamcmd_root
 from core.settings import SettingsManager
 from core.workshop_api import fetch_mod_metadata
 
@@ -11,7 +12,7 @@ APP_ID = 281990
 
 
 def get_steamcmd_root() -> Path:
-    return Path(__file__).resolve().parent.parent / "steamcmd"
+    return get_runtime_steamcmd_root()
 
 
 def get_workshop_content_root() -> Path:

@@ -18,6 +18,7 @@ from PySide6.QtWebChannel import QWebChannel
 from core.database import ModDatabase
 from core.i18n import tr
 from core.library_root import switch_library_root, validate_library_root
+from core.runtime_paths import configure_logging, get_db_path, get_settings_path
 from core.settings import SettingsManager
 from core.updater import check_all_mods_for_updates, update_mod, update_all_mods
 from core.steamcmd import download_mod
@@ -312,7 +313,9 @@ class DownloadFromUrlIdDialog(QDialog):
             self.ensure_queue_title_async(current_id)
 
         # now queue has item(s)
-        self.parent_window.start_download_for_ids(self.queue.copy())
+        started = self.parent_window.start_download_for_ids(self.queue.copy())
+        if not started:
+            return
         # clear queue after starting
         self.queue = []
         self.update_queue_ui()
@@ -1041,7 +1044,9 @@ class WorkshopBrowserDialog(QDialog):
         if not self.queue:
             QMessageBox.information(self, tr("info_no_mods_title"), tr("info_browser_queue_empty"))
             return
-        self.parent_window.start_download_for_ids(self.queue.copy())
+        started = self.parent_window.start_download_for_ids(self.queue.copy())
+        if not started:
+            return
         self.queue = []
         self.update_queue_ui()
 
@@ -1297,6 +1302,8 @@ class SettingsDialog(QDialog):
         return self.get_current_settings_state() != self.original_settings
 
     def confirm_root_change_intent(self):
+        if not self.original_settings["library_root"]:
+            return True
         if self.root_change_warning_acknowledged:
             return True
 
@@ -2032,7 +2039,12 @@ class MainWindow(QMainWindow):
         message_box.exec()
 
         if message_box.clickedButton() == open_settings_button:
-            self.show_settings()
+            if self.show_settings():
+                settings = SettingsManager(self.settings_path)
+                library_root = settings.get_library_root()
+                is_valid, detail = validate_library_root(library_root)
+                if is_valid:
+                    return library_root
 
         return None
 
@@ -2060,11 +2072,11 @@ class MainWindow(QMainWindow):
     def start_download_for_ids(self, workshop_ids):
         download_root = self.require_valid_library_root()
         if not download_root:
-            return
+            return False
 
         if not workshop_ids:
             QMessageBox.warning(self, tr("info_no_mods_title"), tr("warning_no_mod_selected_message"))
-            return
+            return False
 
         self.download_queue = workshop_ids.copy()
         self.download_results = []
@@ -2116,6 +2128,7 @@ class MainWindow(QMainWindow):
             worker.start()
 
         start_next()
+        return True
 
     def show_check_updates(self):
         """Show check updates flow"""
@@ -2241,6 +2254,8 @@ class MainWindow(QMainWindow):
         dialog.exec()
         if dialog.result() == QDialog.Accepted:
             self.refresh_mod_list()
+            return True
+        return False
     
     def refresh_mod_list(self):
         """Refresh the mod list from database."""
@@ -2324,16 +2339,9 @@ class MainWindow(QMainWindow):
         if item:
             self.detail_panel.update_mod_details(item.mod_data)
 
-def get_db_path():
-    """Get the default database path."""
-    return str(Path(__file__).resolve().parent / "data" / "app.db")
-
-def get_settings_path():
-    """Get the default settings path."""
-    return str(Path(__file__).resolve().parent / "data" / "settings.json")
-
 def main():
     """Main application entry point."""
+    configure_logging()
     app = QApplication(sys.argv)
     
     # Set application properties

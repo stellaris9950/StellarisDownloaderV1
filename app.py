@@ -5,19 +5,12 @@ import datetime
 from pathlib import Path
 from core.steamcmd import download_mod
 from core.database import ModDatabase
+from core.runtime_paths import configure_logging, get_db_path, get_settings_path
 from core.updater import check_all_mods_for_updates, update_mod, update_all_mods
 from core.settings import SettingsManager
 
 # Configure logging once for the whole app
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-def get_db_path():
-    """Get the default database path."""
-    return str(Path(__file__).resolve().parent / "data" / "app.db")
-
-def get_settings_path():
-    """Get the default settings path."""
-    return str(Path(__file__).resolve().parent / "data" / "settings.json")
+configure_logging()
 
 def resolve_download_root(explicit_root: str = None) -> str:
     """
